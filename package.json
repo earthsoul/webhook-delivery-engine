@@ -1,0 +1,25 @@
+{
+  "name": "webhook-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A reliable webhook delivery service on Vercel — fan-out, HMAC-SHA256 signing, exponential backoff with jitter, idempotent ingestion, durable per-attempt logs.",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "typecheck": "tsc --noEmit",
+    "migrate": "tsx --env-file=.env scripts/migrate.ts"
+  },
+  "dependencies": {
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@vercel/node": "^3.2.29",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vercel": "^39.2.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
