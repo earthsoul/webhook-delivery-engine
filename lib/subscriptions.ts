@@ -4,6 +4,7 @@ import type {
   CreateSubscriptionInput,
   CreateSubscriptionResult,
   Subscription,
+  UpdateSubscriptionInput,
 } from './types.js';
 
 // -----------------------------------------------------------------------------
@@ -123,4 +124,70 @@ export async function createSubscription(
   `;
   const row = rows[0]!;
   return { ...toSubscription(row), secret: row.secret };
+}
+
+/**
+ * Apply a partial update to a subscription. Only fields that are explicitly
+ * present in `input` change; everything else is preserved.
+ *
+ * Returns the updated row, or null if no live subscription exists with that id
+ * (either the id is wrong or the row is already soft-deleted -- both are 404
+ * to the API layer).
+ *
+ * Implementation note: we use COALESCE(${maybe}, column) per field instead of
+ * a dynamic SET clause. The driver substitutes NULL when a JS field is
+ * undefined, and COALESCE(NULL, existing) keeps the existing value. This is
+ * branchless SQL and reads more clearly than building a query string. It is
+ * safe here because every settable column is NOT NULL -- there is no legitimate
+ * "set this to NULL" case to worry about.
+ */
+export async function updateSubscription(
+  id: string,
+  input: UpdateSubscriptionInput
+): Promise<Subscription | null> {
+  // Empty PATCH -> nothing to write. Read-through so the caller still gets
+  // the current row (or null) without touching disk.
+  if (
+    input.url === undefined &&
+    input.eventTypes === undefined &&
+    input.enabled === undefined
+  ) {
+    return getSubscription(id);
+  }
+
+  const sql = getSql();
+  const rows = await sql<DbSubscriptionPublic[]>`
+    UPDATE subscriptions
+    SET
+      url         = COALESCE(${input.url ?? null}, url),
+      event_types = COALESCE(${input.eventTypes ?? null}, event_types),
+      enabled     = COALESCE(${input.enabled ?? null}, enabled)
+    WHERE id = ${id} AND deleted_at IS NULL
+    RETURNING id, url, event_types, enabled, created_at
+  `;
+  if (rows.length === 0) return null;
+  return toSubscription(rows[0]!);
+}
+
+/**
+ * Soft-delete a subscription by stamping deleted_at = now().
+ *
+ * Returns true if a live row was deleted, false if no live row matched the id
+ * (already deleted, or never existed). The WHERE deleted_at IS NULL clause
+ * makes the operation idempotent at the SQL layer -- a second call returns
+ * false instead of bumping the timestamp.
+ *
+ * We deliberately never DELETE the row. The deliveries table has FK references
+ * to subscriptions; cascading those would destroy the audit trail, restricting
+ * them would block deletion outright. Soft-delete sidesteps both problems and
+ * lets us answer "what subscription was this delivery for?" forever.
+ */
+export async function softDeleteSubscription(id: string): Promise<boolean> {
+  const sql = getSql();
+  const result = await sql`
+    UPDATE subscriptions
+    SET deleted_at = now()
+    WHERE id = ${id} AND deleted_at IS NULL
+  `;
+  return result.count > 0;
 }
