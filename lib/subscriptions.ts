@@ -170,6 +170,40 @@ export async function updateSubscription(
 }
 
 /**
+ * Return every live, enabled subscription whose event_types includes the
+ * given eventType. Used at event-ingestion time to fan out -- one delivery
+ * row per matching subscription.
+ *
+ * The query is shaped to fit the partial GIN index defined in
+ * scripts/migrate.ts (`idx_subscriptions_event_types`):
+ *
+ *   - The WHERE predicate matches the partial-index condition exactly
+ *     (deleted_at IS NULL AND enabled = true), so the planner uses the
+ *     partial GIN instead of scanning the full table.
+ *   - `event_types @> ${[eventType]}` is array-containment -- GIN's
+ *     reason for existing. A regular btree on TEXT[] would be useless;
+ *     a sequential scan would scale linearly with subscription count.
+ *
+ * The `secret` column is intentionally not selected (returns the public
+ * Subscription type). Workers fetch the secret only when they actually
+ * claim a delivery for a subscription.
+ */
+export async function findMatchingSubscriptions(
+  eventType: string
+): Promise<Subscription[]> {
+  const sql = getSql();
+  const rows = await sql<DbSubscriptionPublic[]>`
+    SELECT id, url, event_types, enabled, created_at
+    FROM subscriptions
+    WHERE event_types @> ${[eventType]}
+      AND deleted_at IS NULL
+      AND enabled = true
+    ORDER BY created_at ASC
+  `;
+  return rows.map(toSubscription);
+}
+
+/**
  * Soft-delete a subscription by stamping deleted_at = now().
  *
  * Returns true if a live row was deleted, false if no live row matched the id
