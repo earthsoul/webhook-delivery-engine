@@ -1,21 +1,22 @@
 import postgres from 'postgres';
 
 /**
- * The shape of a postgres.js client. Re-exported so other modules can declare
- * "I accept either the shared client or a transaction handle" in their
- * signatures without importing `postgres` themselves.
+ * Either the shared client OR a transaction handle from `sql.begin`.
  *
- * Inside `sql.begin(async (tx) => ...)`, `tx` has this same type. That's why
- * one function can run against the shared client OR inside a transaction
- * without changing its body.
+ * postgres.js types these as two different shapes -- `Sql` (the full client,
+ * with `.end`, `.listen`, `.begin`, etc.) and `TransactionSql` (subset, no
+ * lifecycle methods). Both extend the same internal `ISql` and both support
+ * the template-literal call signature, which is the only thing our helpers
+ * use. Exposing the union here means a function with a `tx?: Sql` parameter
+ * can be called with either kind of value.
  */
-export type Sql = ReturnType<typeof postgres>;
+export type Sql = postgres.Sql<{}> | postgres.TransactionSql<{}>;
 
 // Module-level cache. The first getSql() call constructs the client; every
 // subsequent call hands back the same instance. Vercel keeps a function's
 // module scope alive across warm invocations, so this also acts as a
 // per-instance connection cache.
-let _sql: Sql | null = null;
+let _sql: postgres.Sql<{}> | null = null;
 
 /**
  * Returns a shared Postgres client connected to Supabase via the pooler.

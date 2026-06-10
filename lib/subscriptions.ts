@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { getSql } from './db.js';
+import { getSql, type Sql } from './db.js';
 import type {
   CreateSubscriptionInput,
   CreateSubscriptionResult,
@@ -189,9 +189,13 @@ export async function updateSubscription(
  * claim a delivery for a subscription.
  */
 export async function findMatchingSubscriptions(
-  eventType: string
+  eventType: string,
+  tx?: Sql
 ): Promise<Subscription[]> {
-  const sql = getSql();
+  // tx lets the caller scope this lookup to the same transaction as the
+  // delivery inserts that follow, so the SELECT and INSERTs see one
+  // consistent snapshot. Optional -- standalone calls use the shared client.
+  const sql = tx ?? getSql();
   const rows = await sql<DbSubscriptionPublic[]>`
     SELECT id, url, event_types, enabled, created_at
     FROM subscriptions
