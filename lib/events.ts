@@ -29,7 +29,7 @@ function toEvent(r: DbEvent): Event {
 // Insert input and result shapes
 // -----------------------------------------------------------------------------
 
-export interface InsertEventInput {
+999export interface InsertEventInput {
   eventType: string;
   payload: Record<string, unknown>;
   /**
