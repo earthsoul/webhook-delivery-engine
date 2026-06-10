@@ -1,4 +1,4 @@
-import { getSql } from './db.js';
+import { getSql, type Sql } from './db.js';
 import type { Event } from './types.js';
 
 // -----------------------------------------------------------------------------
@@ -72,9 +72,13 @@ export interface InsertEventResult {
 // produce a new row -- as the API contract documents.
 // -----------------------------------------------------------------------------
 export async function insertEventIdempotent(
-  input: InsertEventInput
+  input: InsertEventInput,
+  tx?: Sql
 ): Promise<InsertEventResult> {
-  const sql = getSql();
+  // tx allows the caller to bind this insert into a larger transaction
+  // (see api/events for the event+deliveries atomic flow). When omitted,
+  // the function uses the shared client and behaves as a standalone insert.
+  const sql = tx ?? getSql();
   const idempKey = input.idempotencyKey ?? null;
 
   // postgres.js can serialise plain objects as JSONB when the column type is

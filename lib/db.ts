@@ -1,10 +1,21 @@
 import postgres from 'postgres';
 
+/**
+ * The shape of a postgres.js client. Re-exported so other modules can declare
+ * "I accept either the shared client or a transaction handle" in their
+ * signatures without importing `postgres` themselves.
+ *
+ * Inside `sql.begin(async (tx) => ...)`, `tx` has this same type. That's why
+ * one function can run against the shared client OR inside a transaction
+ * without changing its body.
+ */
+export type Sql = ReturnType<typeof postgres>;
+
 // Module-level cache. The first getSql() call constructs the client; every
 // subsequent call hands back the same instance. Vercel keeps a function's
 // module scope alive across warm invocations, so this also acts as a
 // per-instance connection cache.
-let _sql: ReturnType<typeof postgres> | null = null;
+let _sql: Sql | null = null;
 
 /**
  * Returns a shared Postgres client connected to Supabase via the pooler.

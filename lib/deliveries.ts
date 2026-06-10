@@ -1,4 +1,4 @@
-import { getSql } from './db.js';
+import { getSql, type Sql } from './db.js';
 
 // -----------------------------------------------------------------------------
 // Fan-out write
@@ -25,13 +25,17 @@ import { getSql } from './db.js';
  */
 export async function insertPendingDeliveries(
   eventId: string,
-  subscriptionIds: string[]
+  subscriptionIds: string[],
+  tx?: Sql
 ): Promise<number> {
   // Bulk-insert syntax requires at least one row. Short-circuit when nobody
   // matched so we don't ship invalid SQL.
   if (subscriptionIds.length === 0) return 0;
 
-  const sql = getSql();
+  // tx lets the caller bundle this insert with a sibling event-insert into
+  // a single transaction (see api/events). When omitted, runs as a
+  // standalone statement on the shared client.
+  const sql = tx ?? getSql();
   const rows = subscriptionIds.map((subscriptionId) => ({
     event_id: eventId,
     subscription_id: subscriptionId,
