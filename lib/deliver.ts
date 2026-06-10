@@ -38,6 +38,21 @@ export function signPayload(payload: string, secret: string): string {
 const REQUEST_TIMEOUT_MS = 10_000;
 const USER_AGENT = 'webhook-engine/0.1';
 
+/**
+ * Maximum number of bytes of the receiver's response body that we capture for
+ * the per-attempt log. Beyond this we stop reading and append a truncation
+ * marker. Two reasons we cap:
+ *   1. A misbehaving receiver could return a huge body (a full HTML stack
+ *      trace, a streamed error log) -- without a cap, one bad delivery could
+ *      OOM a Vercel function and bloat the deliveries DB unboundedly.
+ *   2. The captured body is for debugging only -- humans rarely want more
+ *      than the first kilobyte or two of an error response. 2KB is a good
+ *      compromise: enough to see the error, small enough to fit comfortably
+ *      in a Postgres TEXT column without TOAST overhead.
+ */
+const MAX_RESPONSE_BODY_BYTES = 2 * 1024;
+const TRUNCATION_MARKER = '\n...[truncated]';
+
 export interface DeliverArgs {
   url: string;
   payload: Record<string, unknown>;
@@ -84,10 +99,10 @@ export async function deliverWebhook(args: DeliverArgs): Promise<DeliveryAttempt
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
-    // Read the body even on non-2xx -- it's useful for the per-attempt log.
-    // (response_body truncation comes in the next commit; for now we capture
-    //  the full body verbatim.)
-    const responseBody = await res.text();
+    // Read the body (capped to MAX_RESPONSE_BODY_BYTES) on success and on
+    // error responses -- the body usually carries the receiver's error
+    // message, which is invaluable for debugging delivery failures.
+    const responseBody = await readBodyTruncated(res, MAX_RESPONSE_BODY_BYTES);
 
     return {
       success: res.ok,
@@ -114,4 +129,46 @@ export async function deliverWebhook(args: DeliverArgs): Promise<DeliveryAttempt
       error: message,
     };
   }
+}
+
+/**
+ * Read at most `maxBytes` of the response body, then stop. Cancels the
+ * underlying stream when the budget is hit so the connection closes promptly
+ * instead of buffering bytes we'd discard.
+ *
+ * Returns the captured prefix as a UTF-8 string, with TRUNCATION_MARKER
+ * appended when the body was longer than `maxBytes`. UTF-8 multi-byte
+ * sequences may split mid-character at the budget boundary -- Node's decoder
+ * substitutes the replacement glyph (U+FFFD) for the partial trailing bytes,
+ * which is acceptable for debug logs.
+ */
+async function readBodyTruncated(res: Response, maxBytes: number): Promise<string> {
+  const reader = res.body?.getReader();
+  if (!reader) return '';
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    if (total + value.length > maxBytes) {
+      // Take just enough bytes to hit the budget, then stop. cancel()
+      // tells undici we don't want the rest -- closes the socket.
+      const remaining = maxBytes - total;
+      if (remaining > 0) chunks.push(value.subarray(0, remaining));
+      truncated = true;
+      await reader.cancel();
+      break;
+    }
+
+    chunks.push(value);
+    total += value.length;
+  }
+
+  const text = Buffer.concat(chunks).toString('utf8');
+  return truncated ? text + TRUNCATION_MARKER : text;
 }
