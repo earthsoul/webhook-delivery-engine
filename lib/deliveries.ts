@@ -1,4 +1,7 @@
 import { getSql, type Sql } from './db.js';
+import { nextAttemptAt } from './backoff.js';
+import type { DeliveryStatus } from './types.js';
+import type { DeliveryAttemptResult } from './deliver.js';
 
 // -----------------------------------------------------------------------------
 // Worker-facing shapes
@@ -171,4 +174,97 @@ export async function insertPendingDeliveries(
     INSERT INTO deliveries ${sql(rows, 'event_id', 'subscription_id')}
   `;
   return result.count;
+}
+
+// -----------------------------------------------------------------------------
+// Result recording -- the post-attempt half of the worker loop
+// -----------------------------------------------------------------------------
+
+/**
+ * Append one row to the delivery_attempts log. Append-only: every HTTP attempt
+ * gets a row, win or lose, so the full delivery history is reconstructable.
+ *
+ * `attemptNum` is 1-based -- the first attempt is attempt 1. The worker passes
+ * (priorAttemptCount + 1).
+ */
+export async function recordAttempt(
+  deliveryId: string,
+  attemptNum: number,
+  result: DeliveryAttemptResult,
+  tx?: Sql
+): Promise<void> {
+  const sql = tx ?? getSql();
+  await sql`
+    INSERT INTO delivery_attempts
+      (delivery_id, attempt_num, http_status, response_body, latency_ms, error)
+    VALUES (
+      ${deliveryId},
+      ${attemptNum},
+      ${result.httpStatus},
+      ${result.responseBody},
+      ${result.latencyMs},
+      ${result.error}
+    )
+  `;
+}
+
+export interface FinalizeResult {
+  /** The status the delivery landed in: delivered | pending (retry) | failed. */
+  status: DeliveryStatus;
+  /** True when the delivery moved to a terminal state (delivered or failed). */
+  terminal: boolean;
+}
+
+/**
+ * Transition a claimed ('delivering') delivery based on the attempt outcome.
+ *
+ *   success            -> status='delivered'                       (terminal)
+ *   fail, attempts<max -> status='pending', next_attempt_at=backoff (retry)
+ *   fail, attempts>=max-> status='failed'                          (terminal)
+ *
+ * `priorAttemptCount` is the attempt_count value the row had when claimed.
+ * We compute newCount = priorAttemptCount + 1 and persist it. The retry
+ * schedule is keyed on newCount so the first retry waits 60s, etc. (see
+ * lib/backoff.ts).
+ *
+ * The WHERE clause pins status='delivering' so this only ever transitions a
+ * row WE claimed -- if a sweeper already reset it to 'pending' (because we
+ * were too slow), this UPDATE matches nothing and we don't clobber the reset.
+ */
+export async function finalizeDelivery(
+  deliveryId: string,
+  priorAttemptCount: number,
+  maxAttempts: number,
+  success: boolean,
+  tx?: Sql
+): Promise<FinalizeResult> {
+  const sql = tx ?? getSql();
+  const newCount = priorAttemptCount + 1;
+
+  if (success) {
+    await sql`
+      UPDATE deliveries
+      SET status = 'delivered', attempt_count = ${newCount}, next_attempt_at = NULL
+      WHERE id = ${deliveryId} AND status = 'delivering'
+    `;
+    return { status: 'delivered', terminal: true };
+  }
+
+  // Failure path. Exhausted -> terminal 'failed'; otherwise schedule a retry.
+  if (newCount >= maxAttempts) {
+    await sql`
+      UPDATE deliveries
+      SET status = 'failed', attempt_count = ${newCount}, next_attempt_at = NULL
+      WHERE id = ${deliveryId} AND status = 'delivering'
+    `;
+    return { status: 'failed', terminal: true };
+  }
+
+  const retryAt = nextAttemptAt(newCount);
+  await sql`
+    UPDATE deliveries
+    SET status = 'pending', attempt_count = ${newCount}, next_attempt_at = ${retryAt}
+    WHERE id = ${deliveryId} AND status = 'delivering'
+  `;
+  return { status: 'pending', terminal: false };
 }
