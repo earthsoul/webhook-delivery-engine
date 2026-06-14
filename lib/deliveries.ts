@@ -260,6 +260,28 @@ export interface FinalizeResult {
 }
 
 /**
+ * Terminally fail a claimed delivery WITHOUT scheduling a retry. Used by the
+ * worker when the destination is no longer a valid target -- the subscription
+ * was disabled or soft-deleted between fan-out and delivery. Retrying would
+ * never succeed (the subscription is still disabled), so we go straight to
+ * 'failed' and record why via a companion recordAttempt call.
+ *
+ * Same status='delivering' compare-and-set guard as finalizeDelivery.
+ */
+export async function failClaimedDelivery(
+  deliveryId: string,
+  newAttemptCount: number,
+  tx?: Sql
+): Promise<void> {
+  const sql = tx ?? getSql();
+  await sql`
+    UPDATE deliveries
+    SET status = 'failed', attempt_count = ${newAttemptCount}, next_attempt_at = NULL
+    WHERE id = ${deliveryId} AND status = 'delivering'
+  `;
+}
+
+/**
  * Transition a claimed ('delivering') delivery based on the attempt outcome.
  *
  *   success            -> status='delivered'                       (terminal)
