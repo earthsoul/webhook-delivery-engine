@@ -177,6 +177,50 @@ export async function insertPendingDeliveries(
 }
 
 // -----------------------------------------------------------------------------
+// Crash recovery -- the stuck-delivery sweeper
+//
+// A delivery is flipped to 'delivering' at claim time, then the worker makes
+// a slow (up to 10s) HTTP call OUTSIDE any transaction. If the worker crashes,
+// times out at the platform level, or is killed mid-call, the row is stranded
+// in 'delivering' forever -- it no longer matches the 'pending' claim query,
+// so nothing ever retries it.
+//
+// The sweeper reclaims those rows. Any row that has been 'delivering' longer
+// than `staleAfterSeconds` (measured by last_attempt_at, which we stamp at
+// claim time) is reset to 'pending' with next_attempt_at=now(), making it
+// immediately eligible for the next claim.
+//
+// The threshold must be comfortably larger than the delivery timeout (10s) so
+// we never reset a row that's legitimately still being delivered. The worker
+// passes 300s (5 minutes) -- 30x the timeout, leaving a wide safety margin.
+//
+// Running this BEFORE the claim each tick means a crashed delivery is
+// recovered on the first cron run after the threshold elapses.
+// -----------------------------------------------------------------------------
+
+/**
+ * Reset deliveries stuck in 'delivering' for longer than `staleAfterSeconds`
+ * back to 'pending', so the next claim retries them. Returns how many rows
+ * were recovered.
+ *
+ * Note: attempt_count is NOT incremented here -- the stuck attempt may or may
+ * not have actually reached the receiver, and there is no delivery_attempts
+ * row for it (the worker crashed before recording one). Treating it as "never
+ * happened" is the safe, at-least-once choice: we would rather re-deliver than
+ * silently drop.
+ */
+export async function resetStuckDeliveries(staleAfterSeconds: number): Promise<number> {
+  const sql = getSql();
+  const result = await sql`
+    UPDATE deliveries
+    SET status = 'pending', next_attempt_at = now()
+    WHERE status = 'delivering'
+      AND last_attempt_at < now() - make_interval(secs => ${staleAfterSeconds})
+  `;
+  return result.count;
+}
+
+// -----------------------------------------------------------------------------
 // Result recording -- the post-attempt half of the worker loop
 // -----------------------------------------------------------------------------
 
