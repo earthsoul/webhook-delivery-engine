@@ -104,7 +104,13 @@ async function main() {
                          CHECK (status IN ('pending','delivering','delivered','failed')),
         attempt_count    INTEGER NOT NULL DEFAULT 0,
         max_attempts     INTEGER NOT NULL DEFAULT 5,
-        next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- Nullable on purpose: a terminal delivery (delivered/failed) has no
+        -- "next attempt", so finalizeDelivery sets this to NULL. Pending rows
+        -- always carry a real timestamp (DEFAULT now() on insert, or an
+        -- explicit retry time), which is what the idx_deliveries_due partial
+        -- index covers. Making this NOT NULL would reject every terminal
+        -- transition with a 23502 not-null violation.
+        next_attempt_at  TIMESTAMPTZ DEFAULT now(),
         last_attempt_at  TIMESTAMPTZ,
         created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
       )
