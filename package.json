@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "vercel dev",
     "typecheck": "tsc --noEmit",
-    "migrate": "tsx --env-file=.env scripts/migrate.ts"
+    "migrate": "tsx --env-file=.env scripts/migrate.ts",
+    "smoke": "tsx --env-file=.env scripts/_smoke/serve.ts",
+    "e2e": "tsx --env-file=.env scripts/_smoke/e2e.ts"
   },
   "dependencies": {
     "postgres": "^3.4.5"

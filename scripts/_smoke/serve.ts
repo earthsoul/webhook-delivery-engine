@@ -18,16 +18,15 @@
  * shims the VercelResponse helpers (`status()`, `json()`, `end()`) the
  * handlers depend on.
  */
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { URL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import subscriptionsIndex from '../../api/subscriptions/index.js';
 import subscriptionsId from '../../api/subscriptions/[id].js';
 import eventsIndex from '../../api/events/index.js';
 import deliveriesIndex from '../../api/deliveries/index.js';
 import deliveriesId from '../../api/deliveries/[id].js';
 import workerHandler from '../../api/worker.js';
-
-const PORT = Number(process.env.PORT ?? 3000);
 
 type ExtendedRequest = IncomingMessage & {
   body?: unknown;
@@ -97,38 +96,74 @@ function decorateResponse(res: ServerResponse) {
   return r;
 }
 
-const server = createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
-  const resolved = resolveRoute(url.pathname);
+export interface SmokeServer {
+  server: Server;
+  /** Resolves once the socket is listening. */
+  ready: Promise<void>;
+  close: () => Promise<void>;
+}
 
-  console.log(`${new Date().toISOString()}  ${req.method}  ${url.pathname}`);
+/**
+ * Build (but optionally don't log) the local API server. Exported so the e2e
+ * harness can run the real handlers in-process instead of shelling out to a
+ * separate `vercel dev`.
+ */
+export function startSmokeServer(opts: { port: number; log?: boolean }): SmokeServer {
+  const { port } = opts;
+  const log = opts.log ?? true;
 
-  if (!resolved) {
-    res.statusCode = 404;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'not_found', path: url.pathname }));
-    return;
-  }
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+    const resolved = resolveRoute(url.pathname);
 
-  try {
-    const reqWithBody = req as ExtendedRequest;
-    reqWithBody.body = await readJsonBody(req);
-    reqWithBody.query = { ...Object.fromEntries(url.searchParams), ...resolved.params };
-    decorateResponse(res);
-    await resolved.handler(reqWithBody, res);
-  } catch (err) {
-    console.error('handler error', err);
-    if (!res.headersSent) {
-      res.statusCode = 500;
+    if (log) console.log(`${new Date().toISOString()}  ${req.method}  ${url.pathname}`);
+
+    if (!resolved) {
+      res.statusCode = 404;
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: 'internal_server_error' }));
+      res.end(JSON.stringify({ error: 'not_found', path: url.pathname }));
+      return;
     }
-  }
-});
 
-server.listen(PORT, () => {
-  console.log(`Local smoke server listening on http://localhost:${PORT}`);
-  console.log(
-    `Try:  curl -i -X POST http://localhost:${PORT}/api/subscriptions -H "Content-Type: application/json" -d '{"url":"https://example.com/hook","eventTypes":["order.created"]}'`
-  );
-});
+    try {
+      const reqWithBody = req as ExtendedRequest;
+      reqWithBody.body = await readJsonBody(req);
+      reqWithBody.query = { ...Object.fromEntries(url.searchParams), ...resolved.params };
+      decorateResponse(res);
+      await resolved.handler(reqWithBody, res);
+    } catch (err) {
+      console.error('handler error', err);
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'internal_server_error' }));
+      }
+    }
+  });
+
+  const ready = new Promise<void>((resolve) => {
+    server.listen(port, () => resolve());
+  });
+
+  const close = () =>
+    new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+
+  return { server, ready, close };
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry point: only runs when executed directly (not when imported).
+// ---------------------------------------------------------------------------
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMain) {
+  const port = Number(process.env.PORT ?? 3000);
+  const s = startSmokeServer({ port });
+  s.ready.then(() => {
+    console.log(`Local smoke server listening on http://localhost:${port}`);
+    console.log(
+      `Try:  curl -i -X POST http://localhost:${port}/api/subscriptions -H "Content-Type: application/json" -d '{"url":"https://example.com/hook","eventTypes":["order.created"]}'`
+    );
+  });
+}
