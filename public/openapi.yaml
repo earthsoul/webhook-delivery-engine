@@ -1,0 +1,505 @@
+openapi: 3.0.3
+info:
+  title: Webhook Delivery Engine API
+  version: 0.1.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  description: |
+    A reliable webhook delivery service: register subscriptions, ingest events,
+    and the engine fans out, signs (HMAC-SHA256), delivers, and retries with
+    exponential backoff -- recording a durable per-attempt log.
+
+    ## Authentication
+    Public endpoints (`/api/subscriptions`, `/api/events`, `/api/deliveries`)
+    are unauthenticated in this portfolio build -- see the README "Security and
+    abuse prevention" section for how API keys / rate limiting would be added.
+
+    The worker endpoint (`/api/worker`) is protected by a bearer token. In
+    production it is driven by Vercel Cron (a `GET` carrying
+    `Authorization: Bearer <CRON_SECRET>`); locally you `POST` it with
+    `Authorization: Bearer <WORKER_SECRET>`.
+
+    ## Webhook signature
+    Every delivered request carries:
+      - `X-Webhook-ID`: the delivery id
+      - `X-Webhook-Timestamp`: unix seconds when the request was signed
+      - `X-Webhook-Signature`: `sha256=<hex>` HMAC-SHA256 of the raw request
+        body, keyed by the subscription's secret. Verify over the RAW bytes.
+
+servers:
+  - url: /
+    description: Same origin as the deployment
+
+tags:
+  - name: Subscriptions
+    description: Register and manage webhook destinations
+  - name: Events
+    description: Ingest events (triggers fan-out to matching subscriptions)
+  - name: Deliveries
+    description: Inspect delivery state and per-attempt history
+  - name: Worker
+    description: Background processor (cron-driven in production)
+
+paths:
+  /api/subscriptions:
+    get:
+      tags: [Subscriptions]
+      operationId: listSubscriptions
+      security: []
+      summary: List subscriptions
+      description: Returns all live (non-deleted) subscriptions, newest first. Secrets are never included.
+      responses:
+        '200':
+          description: A list of subscriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items: { $ref: '#/components/schemas/Subscription' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Subscriptions]
+      operationId: createSubscription
+      security: []
+      summary: Create a subscription
+      description: |
+        Registers a webhook destination and generates an HMAC signing secret.
+        The `secret` is returned ONCE in this response and never again.
+
+        The URL must be `https://` and must not resolve to a private,
+        loopback, or link-local address (SSRF guard).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSubscriptionInput' }
+            examples:
+              order-events:
+                value:
+                  url: https://example.com/webhooks
+                  eventTypes: [order.created, order.refunded]
+      responses:
+        '201':
+          description: Subscription created (includes the one-time secret)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/SubscriptionWithSecret' }
+        '400':
+          description: Validation error or rejected URL
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                not-https:
+                  value: { error: protocol_not_https, message: 'url must use https:// (got http:)' }
+                private-ip:
+                  value: { error: private_ip_blocked, message: 'url host 127.0.0.1 is in a private/loopback/link-local range and cannot be used as a webhook destination' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/subscriptions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionId'
+    get:
+      tags: [Subscriptions]
+      operationId: getSubscription
+      security: []
+      summary: Get a subscription
+      responses:
+        '200':
+          description: The subscription
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Subscriptions]
+      operationId: updateSubscription
+      security: []
+      summary: Update a subscription (partial)
+      description: |
+        Partial update -- only fields present in the body change. An empty body
+        is a no-op read-through. If `url` is changed it is re-validated by the
+        SSRF guard.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateSubscriptionInput' }
+            examples:
+              disable:
+                value: { enabled: false }
+      responses:
+        '200':
+          description: The updated subscription
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Subscriptions]
+      operationId: deleteSubscription
+      security: []
+      summary: Delete a subscription (soft delete)
+      description: Soft-deletes the subscription (stamps `deleted_at`). Delivery history is preserved.
+      responses:
+        '204':
+          description: Deleted (no content)
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/events:
+    post:
+      tags: [Events]
+      operationId: ingestEvent
+      security: []
+      summary: Ingest an event
+      description: |
+        Records an event and fans out one pending delivery per matching,
+        enabled subscription. Supply an `idempotencyKey` to make retries safe:
+        a replay returns the original event with `duplicate: true` and creates
+        no new deliveries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IngestEventRequest' }
+            examples:
+              order-created:
+                value:
+                  eventType: order.created
+                  payload: { orderId: ord_123, amount: 4200 }
+                  idempotencyKey: ord_123-created
+      responses:
+        '202':
+          description: Event accepted; deliveries scheduled asynchronously
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestEventResult' }
+              example: { eventId: 8f1d6c2a-3b4e-4d5f-9a1b-2c3d4e5f6a7b, deliveriesScheduled: 2, message: event accepted }
+        '200':
+          description: Idempotent replay; original event returned, no new deliveries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestEventResult' }
+              example: { eventId: 8f1d6c2a-3b4e-4d5f-9a1b-2c3d4e5f6a7b, deliveriesScheduled: 0, message: 'duplicate idempotency key; returning original event', duplicate: true }
+        '400':
+          description: Validation error (bad eventType, payload, or oversized payload)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/deliveries:
+    get:
+      tags: [Deliveries]
+      operationId: listDeliveries
+      security: []
+      summary: List deliveries
+      description: Lists deliveries newest-first, with optional AND-combined filters.
+      parameters:
+        - name: eventId
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: subscriptionId
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/DeliveryStatus' }
+        - name: limit
+          in: query
+          required: false
+          description: Page size, clamped to [1, 500]. Defaults to 100.
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: Matching deliveries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items: { $ref: '#/components/schemas/Delivery' }
+        '400':
+          description: A supplied filter was malformed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/deliveries/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Deliveries]
+      operationId: getDelivery
+      security: []
+      summary: Get a delivery with its attempt history
+      responses:
+        '200':
+          description: The delivery, with attempts nested (oldest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivery: { $ref: '#/components/schemas/DeliveryWithAttempts' }
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/worker:
+    get:
+      tags: [Worker]
+      operationId: runWorkerCron
+      summary: Run the worker (cron)
+      description: |
+        The method Vercel Cron uses. Sweeps stuck deliveries, claims a batch of
+        due pending deliveries, attempts each, and records the outcome.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Run summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Worker]
+      operationId: runWorkerManual
+      summary: Run the worker (manual / local)
+      description: Identical to GET; this is the method used for manual and local invocation.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Run summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'Authorization: Bearer <WORKER_SECRET> (manual) or <CRON_SECRET> (Vercel Cron)'
+
+  parameters:
+    SubscriptionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: not_found }
+    InvalidId:
+      description: The id path parameter is not a UUID
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: invalid_id, message: id must be a UUID }
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: unauthorized }
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: internal_error }
+
+  schemas:
+    DeliveryStatus:
+      type: string
+      enum: [pending, delivering, delivered, failed]
+      description: |
+        pending = waiting for the worker; delivering = claimed/in-flight;
+        delivered = received a 2xx (terminal); failed = max attempts reached (terminal).
+
+    Subscription:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        eventTypes:
+          type: array
+          items: { type: string }
+        enabled: { type: boolean }
+        createdAt: { type: string, format: date-time }
+      required: [id, url, eventTypes, enabled, createdAt]
+
+    SubscriptionWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/Subscription'
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: One-time HMAC signing secret (prefix whsec_). Store it; it is never returned again.
+          required: [secret]
+
+    CreateSubscriptionInput:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Must be https:// and not a private/loopback/link-local host.
+        eventTypes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { type: string, maxLength: 100 }
+      required: [url, eventTypes]
+
+    UpdateSubscriptionInput:
+      type: object
+      description: All fields optional; only present fields are changed.
+      properties:
+        url: { type: string, format: uri }
+        eventTypes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { type: string, maxLength: 100 }
+        enabled: { type: boolean }
+
+    IngestEventRequest:
+      type: object
+      properties:
+        eventType: { type: string, maxLength: 100 }
+        payload:
+          type: object
+          additionalProperties: true
+          description: Arbitrary JSON object (max 256 KB serialized).
+        idempotencyKey:
+          type: string
+          maxLength: 200
+          description: Optional dedupe key. Replays return the original event.
+      required: [eventType, payload]
+
+    IngestEventResult:
+      type: object
+      properties:
+        eventId: { type: string, format: uuid }
+        deliveriesScheduled: { type: integer }
+        message: { type: string }
+        duplicate:
+          type: boolean
+          description: Present and true only on an idempotent replay.
+      required: [eventId, deliveriesScheduled, message]
+
+    Delivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        eventId: { type: string, format: uuid }
+        subscriptionId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/DeliveryStatus' }
+        attemptCount: { type: integer }
+        maxAttempts: { type: integer }
+        nextAttemptAt: { type: string, format: date-time, nullable: true }
+        lastAttemptAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+      required: [id, eventId, subscriptionId, status, attemptCount, maxAttempts, createdAt]
+
+    DeliveryAttempt:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        deliveryId: { type: string, format: uuid }
+        attemptNum: { type: integer }
+        httpStatus: { type: integer, nullable: true }
+        responseBody:
+          type: string
+          nullable: true
+          description: Truncated to ~2 KB.
+        latencyMs: { type: integer, nullable: true }
+        error:
+          type: string
+          nullable: true
+          description: Transport-level error (timeout, DNS, connection refused), if any.
+        attemptedAt: { type: string, format: date-time }
+      required: [id, deliveryId, attemptNum, attemptedAt]
+
+    DeliveryWithAttempts:
+      allOf:
+        - $ref: '#/components/schemas/Delivery'
+        - type: object
+          properties:
+            attempts:
+              type: array
+              items: { $ref: '#/components/schemas/DeliveryAttempt' }
+          required: [attempts]
+
+    WorkerSummary:
+      type: object
+      properties:
+        swept:
+          type: integer
+          description: Stuck 'delivering' rows reset to pending this run.
+        processed:
+          type: integer
+          description: Deliveries claimed and attempted this run.
+        delivered: { type: integer }
+        retrying:
+          type: integer
+          description: Failed this run but still under max attempts (re-queued).
+        failed:
+          type: integer
+          description: Reached max attempts (terminal) this run.
+      required: [swept, processed, delivered, retrying, failed]
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable detail (optional).
+        field:
+          type: string
+          description: The offending input field, for validation errors (optional).
+      required: [error]
