@@ -1,6 +1,12 @@
 import { getSql, type Sql } from './db.js';
 import { nextAttemptAt } from './backoff.js';
-import type { DeliveryStatus } from './types.js';
+import type {
+  Delivery,
+  DeliveryAttempt,
+  DeliveryQuery,
+  DeliveryStatus,
+  DeliveryWithAttempts,
+} from './types.js';
 import type { DeliveryAttemptResult } from './deliver.js';
 
 // -----------------------------------------------------------------------------
@@ -333,4 +339,137 @@ export async function finalizeDelivery(
     WHERE id = ${deliveryId} AND status = 'delivering'
   `;
   return { status: 'pending', terminal: false };
+}
+
+// -----------------------------------------------------------------------------
+// Read side -- the public deliveries API (GET /api/deliveries[/:id])
+//
+// These return the PUBLIC Delivery / DeliveryAttempt shapes: no secret, no
+// event payload. They are safe to expose over HTTP.
+// -----------------------------------------------------------------------------
+
+interface DbDelivery {
+  id: string;
+  event_id: string;
+  subscription_id: string;
+  status: string;
+  attempt_count: number;
+  max_attempts: number;
+  next_attempt_at: Date | string | null;
+  last_attempt_at: Date | string | null;
+  created_at: Date | string;
+}
+
+function toDelivery(r: DbDelivery): Delivery {
+  return {
+    id: r.id,
+    eventId: r.event_id,
+    subscriptionId: r.subscription_id,
+    status: r.status as DeliveryStatus,
+    attemptCount: r.attempt_count,
+    maxAttempts: r.max_attempts,
+    nextAttemptAt: r.next_attempt_at === null ? null : new Date(r.next_attempt_at).toISOString(),
+    lastAttemptAt: r.last_attempt_at === null ? null : new Date(r.last_attempt_at).toISOString(),
+    createdAt: new Date(r.created_at).toISOString(),
+  };
+}
+
+interface DbDeliveryAttempt {
+  id: string;
+  delivery_id: string;
+  attempt_num: number;
+  http_status: number | null;
+  response_body: string | null;
+  latency_ms: number | null;
+  error: string | null;
+  attempted_at: Date | string;
+}
+
+function toDeliveryAttempt(r: DbDeliveryAttempt): DeliveryAttempt {
+  return {
+    id: r.id,
+    deliveryId: r.delivery_id,
+    attemptNum: r.attempt_num,
+    httpStatus: r.http_status,
+    responseBody: r.response_body,
+    latencyMs: r.latency_ms,
+    error: r.error,
+    attemptedAt: new Date(r.attempted_at).toISOString(),
+  };
+}
+
+/**
+ * List deliveries matching an optional set of filters, newest first.
+ *
+ * All three filters (eventId, subscriptionId, status) are optional and
+ * AND-combined. With no filters, returns the most recent `limit` deliveries.
+ *
+ * The dynamic WHERE is built by composing parameterised sql`` fragments --
+ * every value is still a bound parameter, never string-interpolated, so this
+ * is injection-safe despite being "dynamic".
+ */
+export async function queryDeliveries(
+  q: DeliveryQuery,
+  limit = 100
+): Promise<Delivery[]> {
+  const sql = getSql();
+
+  const conds = [];
+  if (q.eventId) conds.push(sql`event_id = ${q.eventId}`);
+  if (q.subscriptionId) conds.push(sql`subscription_id = ${q.subscriptionId}`);
+  if (q.status) conds.push(sql`status = ${q.status}`);
+
+  // Fold the fragments into "a AND b AND c", or an empty fragment if no
+  // filters were supplied (postgres.js treats an empty sql`` as no-op text).
+  const where =
+    conds.length > 0
+      ? conds.reduce((acc, cur) => sql`${acc} AND ${cur}`)
+      : sql``;
+  const whereClause = conds.length > 0 ? sql`WHERE ${where}` : sql``;
+
+  const rows = await sql<DbDelivery[]>`
+    SELECT id, event_id, subscription_id, status, attempt_count, max_attempts,
+           next_attempt_at, last_attempt_at, created_at
+    FROM deliveries
+    ${whereClause}
+    ORDER BY created_at DESC
+    LIMIT ${limit}
+  `;
+  return rows.map(toDelivery);
+}
+
+/**
+ * Fetch a single delivery by id with its full attempt history nested in,
+ * ordered oldest attempt first. Returns null if the delivery doesn't exist.
+ *
+ * Two queries, not a join: a join would repeat every delivery column once per
+ * attempt row, and we'd de-dupe in app code anyway. Two clean queries are
+ * simpler and the second is a single indexed lookup on delivery_id.
+ */
+export async function getDeliveryWithAttempts(
+  id: string
+): Promise<DeliveryWithAttempts | null> {
+  const sql = getSql();
+
+  const deliveryRows = await sql<DbDelivery[]>`
+    SELECT id, event_id, subscription_id, status, attempt_count, max_attempts,
+           next_attempt_at, last_attempt_at, created_at
+    FROM deliveries
+    WHERE id = ${id}
+    LIMIT 1
+  `;
+  if (deliveryRows.length === 0) return null;
+
+  const attemptRows = await sql<DbDeliveryAttempt[]>`
+    SELECT id, delivery_id, attempt_num, http_status, response_body,
+           latency_ms, error, attempted_at
+    FROM delivery_attempts
+    WHERE delivery_id = ${id}
+    ORDER BY attempt_num ASC
+  `;
+
+  return {
+    ...toDelivery(deliveryRows[0]!),
+    attempts: attemptRows.map(toDeliveryAttempt),
+  };
 }
