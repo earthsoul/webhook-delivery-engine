@@ -23,31 +23,52 @@ const BATCH_SIZE = 50;
 const STALE_AFTER_SECONDS = 300;
 
 /**
- * Constant-time bearer-token check. Protects the worker from being driven by
- * random internet traffic -- only callers presenting the WORKER_SECRET (Vercel
- * Cron, configured with the same value) get through.
- *
+ * Constant-time comparison of a presented token against an expected one.
  * timingSafeEqual (not ===) so an attacker can't recover the secret byte by
  * byte via response-timing measurement. Length is checked first because
  * timingSafeEqual throws on length mismatch -- and that check is itself
  * constant-cost (it doesn't depend on the secret's content).
  */
+function tokenMatches(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Authorize a worker invocation. Two legitimate callers exist:
+ *
+ *   - Vercel Cron (production): fires a GET and, when a CRON_SECRET env var is
+ *     configured, automatically attaches `Authorization: Bearer <CRON_SECRET>`.
+ *   - Manual / local runs (curl, the e2e harness): POST with
+ *     `Authorization: Bearer <WORKER_SECRET>`.
+ *
+ * We accept the token if it matches EITHER configured secret. Each comparison
+ * is constant-time, and we always compare against every configured secret
+ * (no early return on the first match) so the response time doesn't reveal
+ * which secret -- if any -- the token matched.
+ *
+ * Fail closed: if neither secret is configured, nobody is authorized.
+ */
 function isAuthorized(req: VercelRequest): boolean {
-  const expected = process.env.WORKER_SECRET;
-  if (!expected) {
-    // Fail closed: if the secret isn't configured, nobody is authorized.
-    console.error('WORKER_SECRET is not set; refusing all worker calls');
+  const secrets = [process.env.WORKER_SECRET, process.env.CRON_SECRET].filter(
+    (s): s is string => typeof s === 'string' && s.length > 0
+  );
+  if (secrets.length === 0) {
+    console.error('Neither WORKER_SECRET nor CRON_SECRET is set; refusing all worker calls');
     return false;
   }
 
   const header = req.headers.authorization;
   if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
-
   const presented = header.slice('Bearer '.length);
-  const a = Buffer.from(presented, 'utf8');
-  const b = Buffer.from(expected, 'utf8');
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+
+  let authorized = false;
+  for (const secret of secrets) {
+    if (tokenMatches(presented, secret)) authorized = true;
+  }
+  return authorized;
 }
 
 /**
@@ -102,8 +123,10 @@ async function processDelivery(d: ClaimedDelivery): Promise<DeliveryStatus> {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST, OPTIONS');
+  // GET is the method Vercel Cron uses; POST is for manual/local invocation.
+  // Both are accepted -- the bearer-token check below is the real gate.
+  if (req.method !== 'POST' && req.method !== 'GET') {
+    res.setHeader('Allow', 'GET, POST, OPTIONS');
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 

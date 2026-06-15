@@ -1,5 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["iad1"],
+  "crons": [
+    {
+      "path": "/api/worker",
+      "schedule": "* * * * *"
+    }
+  ],
   "functions": {
     "api/**/*.ts": {
       "runtime": "@vercel/node@3.2.29"
