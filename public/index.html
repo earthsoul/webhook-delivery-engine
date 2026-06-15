@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Webhook Delivery Engine &mdash; API Reference</title>
+    <meta
+      name="description"
+      content="Interactive API reference for the Webhook Delivery Engine: subscriptions, event ingestion with fan-out, HMAC-signed delivery, and retries with exponential backoff." />
+  </head>
+  <body>
+    <!-- Scalar mounts the interactive reference here. -->
+    <div id="app"></div>
+
+    <!--
+      Pinned to a specific version for reproducibility. Scalar recommends the
+      unpinned `@scalar/api-reference` to get continuous fixes, but a portfolio
+      project benefits from a deterministic build that can't change under it.
+      The spec is served same-origin (/openapi.yaml), so no CORS proxy is needed.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.59.3"></script>
+    <script>
+      Scalar.createApiReference('#app', {
+        url: '/openapi.yaml',
+        theme: 'purple',
+        // The worker needs a bearer token; let the "Try it" panel send one.
+        authentication: {
+          preferredSecurityScheme: 'bearerAuth',
+        },
+        metaData: {
+          title: 'Webhook Delivery Engine API',
+        },
+      });
+    </script>
+  </body>
+</html>

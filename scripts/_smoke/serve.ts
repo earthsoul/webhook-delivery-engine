@@ -21,6 +21,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { URL } from 'node:url';
 import { fileURLToPath } from 'node:url';
+import { readFile } from 'node:fs/promises';
 import subscriptionsIndex from '../../api/subscriptions/index.js';
 import subscriptionsId from '../../api/subscriptions/[id].js';
 import eventsIndex from '../../api/events/index.js';
@@ -78,6 +79,32 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
   });
 }
 
+// Static files Vercel serves automatically from public/ at the root. We mirror
+// just the two we need so `npm run smoke` previews the docs at http://localhost
+// the same way the deployment does. Maps a request path to a file + content type.
+const PUBLIC_DIR = fileURLToPath(new URL('../../public/', import.meta.url));
+const STATIC_ROUTES: Record<string, { file: string; type: string }> = {
+  '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
+  '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
+  '/openapi.yaml': { file: 'openapi.yaml', type: 'text/yaml; charset=utf-8' },
+};
+
+async function tryServeStatic(pathname: string, res: ServerResponse): Promise<boolean> {
+  const route = STATIC_ROUTES[pathname];
+  if (!route) return false;
+  try {
+    const body = await readFile(`${PUBLIC_DIR}${route.file}`);
+    res.statusCode = 200;
+    res.setHeader('Content-Type', route.type);
+    res.end(body);
+  } catch {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'not_found', path: pathname }));
+  }
+  return true;
+}
+
 // Add the chainable helpers our handlers expect from VercelResponse.
 function decorateResponse(res: ServerResponse) {
   const r = res as ServerResponse & {
@@ -117,6 +144,9 @@ export function startSmokeServer(opts: { port: number; log?: boolean }): SmokeSe
     const resolved = resolveRoute(url.pathname);
 
     if (log) console.log(`${new Date().toISOString()}  ${req.method}  ${url.pathname}`);
+
+    // Serve the docs page + spec before API routing.
+    if (req.method === 'GET' && (await tryServeStatic(url.pathname, res))) return;
 
     if (!resolved) {
       res.statusCode = 404;
