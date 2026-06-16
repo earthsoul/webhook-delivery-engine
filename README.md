@@ -6,6 +6,7 @@ It's the kind of system that sits behind "Settings → Webhooks" in products lik
 
 - **Interactive API docs:** served at `/` (Scalar, rendered from [`public/openapi.yaml`](public/openapi.yaml)).
 - **One-command local end-to-end test:** `npm run e2e`.
+- **Companion project:** [**rate-limiter-service**](https://github.com/earthsoul/rate-limiter-service) — a configurable rate-limiting microservice (sliding-window counters in Redis, rules in Postgres). It's the natural front door for this engine: a single `POST /api/check` in front of the public endpoints adds per-tenant quotas (see [Security and abuse prevention](#security-and-abuse-prevention)).
 
 ---
 
